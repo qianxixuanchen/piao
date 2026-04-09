@@ -378,6 +378,97 @@ const utils = {
     },
 
     /**
+     * 分析历史上涨阶段
+     * 在最近100个交易日中找出连续上涨的阶段（至少5个交易日，允许1-2天调整）
+     * @param {Array} klineData - K线数据数组，每条含 { date, close, increase, ... }
+     * @returns {Array} 上涨阶段列表
+     */
+    analyzeUpPhases: (klineData) => {
+        if (!klineData || klineData.length < 5) return [];
+
+        // 取最近100个交易日
+        const data = klineData.slice(-100);
+        const phases = [];
+
+        let i = 0;
+        while (i < data.length) {
+            // 寻找一个潜在的上涨阶段起点
+            // 起点条件：当日上涨
+            if (parseFloat(data[i].increase) <= 0) {
+                i++;
+                continue;
+            }
+
+            // 从 i 开始尝试构建一个上涨阶段
+            let startIdx = i;
+            let upDays = 0;         // 上涨天数
+            let downDays = 0;       // 调整天数（阶段内）
+            let consecutiveDown = 0; // 连续下跌计数
+            let j = i;
+            let phaseEnd = i;       // 阶段有效结束位置（最后一个上涨日）
+
+            while (j < data.length) {
+                const inc = parseFloat(data[j].increase) || 0;
+
+                if (inc > 0) {
+                    // 上涨日
+                    upDays++;
+                    consecutiveDown = 0;
+                    phaseEnd = j;  // 更新有效结束位置
+                } else {
+                    // 下跌/平盘日（调整）
+                    consecutiveDown++;
+                    downDays++;
+
+                    // 连续下跌超过2天，阶段结束
+                    if (consecutiveDown > 2) {
+                        break;
+                    }
+
+                    // 总调整天数不能超过上涨天数的40%
+                    // 避免 "涨2跌2涨2跌2" 这种震荡被识别为上涨
+                    if (upDays > 0 && downDays > upDays * 0.5) {
+                        break;
+                    }
+                }
+                j++;
+            }
+
+            // 判断是否符合上涨阶段条件
+            const totalDays = phaseEnd - startIdx + 1;
+            if (upDays >= 4 && totalDays >= 5) {
+                const startPrice = data[startIdx].close;
+                const endPrice = data[phaseEnd].close;
+                // 用起始日前一天的收盘价作为真实起点（如果有的话）
+                const basePrice = startIdx > 0 ? data[startIdx - 1].close : data[startIdx].open;
+                const totalGain = ((endPrice - basePrice) / basePrice * 100).toFixed(2);
+
+                // 只保留涨幅为正的阶段
+                if (parseFloat(totalGain) > 0) {
+                    phases.push({
+                        startDate: data[startIdx].date,
+                        endDate: data[phaseEnd].date,
+                        startPrice: basePrice,
+                        endPrice: endPrice,
+                        totalDays,
+                        upDays,
+                        downDays: totalDays - upDays,
+                        totalGain: parseFloat(totalGain),
+                        // 计算阶段内最高价和最低价
+                        highPrice: Math.max(...data.slice(startIdx, phaseEnd + 1).map(d => d.high)),
+                        lowPrice: Math.min(...data.slice(startIdx, phaseEnd + 1).map(d => d.low)),
+                    });
+                }
+            }
+
+            // 从阶段结束位置的下一个位置继续搜索
+            i = phaseEnd + 1;
+        }
+
+        return phases;
+    },
+
+    /**
      * 日志输出（带时间戳）
      */
     log: {
@@ -512,7 +603,7 @@ const parser = {
     /**
      * 解析K线数据
      */
-    kline: (text, maxCount = 50) => {
+    kline: (text, maxCount = 100) => {
         const match = text.match(/\[[\s\S]*\]/);
         if (!match) return null;
 
@@ -1094,6 +1185,24 @@ const stockService = {
         const pullbackList = result.filter(item => item.isPullback);
         console.log(`   ✅ 找到 ${pullbackList.length} 只回调买入机会\n`);
 
+        // 步骤4: 分析历史上涨阶段
+        console.log('📈 步骤4: 分析历史上涨阶段...');
+        console.log('   规则: 100个交易日内，至少5天上涨趋势，允许1-2天调整');
+
+        let hasUpPhaseCount = 0;
+        result.forEach(item => {
+            const phases = utils.analyzeUpPhases(item.data);
+            item.upPhases = phases;
+            item.hasUpPhase = phases.length > 0;
+            if (item.hasUpPhase) {
+                hasUpPhaseCount++;
+                // 计算最强上涨阶段
+                const best = phases.reduce((a, b) => a.totalGain > b.totalGain ? a : b);
+                item.bestUpPhase = best;
+            }
+        });
+        console.log(`   ✅ 找到 ${hasUpPhaseCount} 只存在历史上涨阶段的股票\n`);
+
         utils.ensureDir(CONFIG.files.assetsDir);
         utils.writeJSON(`${CONFIG.files.assetsDir}/us_trendup.json`, result);
 
@@ -1119,6 +1228,7 @@ const stockService = {
         console.log(`➖ 震荡整理 (25-39分): ${neutral} 只`);
         console.log(`📉 下跌趋势 (<25分):   ${down} 只`);
         console.log(`🎯 回调买入机会:       ${pullbackList.length} 只`);
+        console.log(`📈 历史上涨阶段:       ${hasUpPhaseCount} 只`);
         console.log(`\n结果已保存到: ${CONFIG.files.assetsDir}/us_trendup.json`);
 
         // 显示大涨股票 TOP 20
@@ -1190,6 +1300,20 @@ const stockService = {
                 const increase = lastDay ? lastDay.increase : 0;
                 const name = (item.name || '').substring(0, 10).padEnd(12);
                 console.log(`${(i + 1).toString().padStart(2)}. ${item.symbol.padEnd(6)} ${name} ${increase}%  评分:${item.trendScore}  MA5:${item.MA5} MA10:${item.MA10} MA30:${item.MA30}`);
+            });
+        }
+
+        // 显示历史上涨阶段 TOP 20（按最强阶段涨幅排序）
+        const upPhaseStocks = result.filter(item => item.hasUpPhase);
+        if (upPhaseStocks.length > 0) {
+            const sortedByPhase = [...upPhaseStocks].sort((a, b) => (b.bestUpPhase?.totalGain || 0) - (a.bestUpPhase?.totalGain || 0));
+            console.log('\n===== 📈 历史上涨阶段 TOP 20 =====');
+            console.log('（100日内存在≥5天连续上涨趋势，按最强阶段涨幅排序）');
+            sortedByPhase.slice(0, 20).forEach((item, i) => {
+                const best = item.bestUpPhase;
+                const name = (item.name || '').substring(0, 10).padEnd(12);
+                const phaseCount = item.upPhases.length;
+                console.log(`${(i + 1).toString().padStart(2)}. ${item.symbol.padEnd(6)} ${name} 共${phaseCount}个上涨阶段  最强: ${best.startDate}~${best.endDate} ${best.totalDays}天 +${best.totalGain}%`);
             });
         }
     },
