@@ -1,0 +1,5 @@
+{
+    "file.assoctiations": {
+        "*.css": "tailwindcss"
+    }
+}
