@@ -1,1 +1,9 @@
 node_modules
+
+# 数据缓存文件（体积大，不需要上传）
+us_klines.json
+us_all_stocks.json
+us_error.json
+us_list_progress.json
+us_kline_progress.json
+favorites.json
